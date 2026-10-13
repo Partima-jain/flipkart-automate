@@ -1,0 +1,15 @@
+{
+  "name": "flipkart-automate",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Open Flipkart mobile browser already logged in via saved cookies",
+  "scripts": {
+    "start": "node open-mobile.js",
+    "mobile": "node open-mobile.js",
+    "qr": "node qr-demo.js"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0",
+    "qrcode": "^1.5.4"
+  }
+}
