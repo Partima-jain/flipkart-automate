@@ -7,10 +7,14 @@
     "start": "node open-mobile.js",
     "mobile": "node open-mobile.js",
     "accounts": "node run-accounts.js",
+    "accounts:fast": "node run-accounts.js --concurrency=3",
+    "orders": "node check-orders.js",
+    "orders:excel": "node check-orders.js --from-json",
     "qr": "node qr-demo.js"
   },
   "dependencies": {
     "playwright": "^1.64.0",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "xlsx": "^0.18.5"
   }
 }

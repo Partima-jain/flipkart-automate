@@ -3,11 +3,17 @@
  * open logged-in Incognito (Pixel 7 responsive) → Buy now → COD → Place Order → next SKU.
  * Skips suggested/wrong/unavailable items. Watches navigations for order-success signals.
  *
- * Optional checklist prompts: node run-accounts.js --ask
+ * Parallel accounts (bounded pool — does not open all Chromes at once):
+ *   node run-accounts.js --concurrency=3
+ *   CONCURRENCY=3 node run-accounts.js
+ *
+ * Optional checklist prompts (forces concurrency=1): node run-accounts.js --ask
  */
+// node run-accounts.js --concurrency=4
 
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const readline = require("readline/promises");
 const { stdin, stdout } = require("process");
 const { openFlipkartMobileSession } = require("./lib/session");
@@ -16,6 +22,23 @@ const COOKIE_FILE = path.join(__dirname, "cookie.json");
 const RESULTS_FILE = path.join(__dirname, "account-results.json");
 const CART_URL = "https://www.flipkart.com/viewcart";
 const ASK = process.argv.includes("--ask");
+
+function parseConcurrency() {
+  const arg = process.argv.find((a) => a.startsWith("--concurrency="));
+  const raw = arg ? arg.split("=")[1] : process.env.CONCURRENCY;
+  let n = parseInt(raw || "2", 10);
+  if (!Number.isFinite(n) || n < 1) n = 2;
+  // Cap so we don't spawn dozens of Chromes and thrash the machine / Flipkart
+  const max = Math.max(1, Math.min(6, parseInt(process.env.CONCURRENCY_MAX || "6", 10) || 6));
+  if (ASK) return 1;
+  return Math.min(n, max);
+}
+
+const CONCURRENCY = parseConcurrency();
+const START_STAGGER_MS = Math.max(
+  0,
+  parseInt(process.env.START_STAGGER_MS || "2500", 10) || 2500
+);
 
 /** URL patterns that usually mean checkout finished successfully */
 const ORDER_SUCCESS_URL = [
@@ -87,8 +110,36 @@ function readResults() {
   }
 }
 
+let resultsWriteChain = Promise.resolve();
+
 function saveResults(results) {
-  fs.writeFileSync(RESULTS_FILE, JSON.stringify(results, null, 2));
+  // Serialize writes when multiple workers finish near the same time
+  resultsWriteChain = resultsWriteChain.then(() => {
+    fs.writeFileSync(RESULTS_FILE, JSON.stringify(results, null, 2));
+  });
+  return resultsWriteChain;
+}
+
+/** Run up to `concurrency` async workers over items (pool, not all-at-once). */
+async function mapPool(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+
+  async function run() {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await worker(items[i], i);
+    }
+  }
+
+  const n = Math.min(Math.max(1, concurrency), items.length || 1);
+  await Promise.all(Array.from({ length: n }, () => run()));
+  return results;
+}
+
+function logFor(id, ...args) {
+  console.log(`[${id}]`, ...args);
 }
 
 function allPages(browser) {
@@ -1429,6 +1480,124 @@ async function askChecklist(rl, id, results, detected) {
   console.log(`Saved result for ${id}: ${status} (order_placed=${detected.order_placed})`);
 }
 
+async function processAccount(id, { index, total, slotIndex, results, rl }) {
+  logFor(id, `=== [${index + 1}/${total}] start (slot ${slotIndex}) ===`);
+  let browser;
+  let cleanup = () => {};
+  const detected = {
+    order_placed: false,
+    evidence: null,
+    evidence_url: null,
+    cod_unavailable: false,
+  };
+  let stopWatcher = () => {};
+
+  try {
+    const session = await openFlipkartMobileSession(id, { slotIndex });
+    browser = session.browser;
+    cleanup = session.cleanup || cleanup;
+    logFor(id, `Loaded ${session.cookieCount} cookies`);
+
+    stopWatcher = attachOrderWatcher(browser, detected);
+
+    const context = browser.contexts()[0];
+    const page = context.pages()[0];
+
+    for (const product of PRODUCTS) {
+      logFor(id, `--- ${product.key} ---`);
+
+      if (page.isClosed()) {
+        logFor(id, "Page closed — stopping products for this account.");
+        break;
+      }
+
+      let result;
+      try {
+        result = await inspectAndAddProduct(page, product);
+      } catch (err) {
+        if (/has been closed/i.test(String(err.message || err))) {
+          logFor(id, "Browser/page closed during product — stopping this account.");
+          break;
+        }
+        result = {
+          status: "skipped",
+          reason: "error",
+          error: String(err.message || err),
+        };
+      }
+
+      logFor(id, "Result:", result);
+
+      if (result.status === "account_done" || result.reason === "cod_unavailable") {
+        logFor(id, "COD unavailable — closing this account.");
+        detected.cod_unavailable = true;
+        break;
+      }
+
+      if (result.status === "skipped") {
+        logFor(id, "Continuing to next product…");
+        continue;
+      }
+
+      if (result.status === "continued" && !page.isClosed()) {
+        logFor(
+          id,
+          result.order?.success
+            ? `Order signal for ${product.name}. Next SKU shortly…`
+            : `Place Order attempted for ${product.name}. Next SKU shortly…`
+        );
+        // Shorter pause when running parallel (less idle wall-clock time)
+        const pauseMs = CONCURRENCY > 1 ? 1500 : 3000;
+        await page.waitForTimeout(pauseMs).catch(() => {});
+      }
+    }
+
+    logFor(id, "All products done — closing session…");
+  } catch (err) {
+    logFor(id, `Account error: ${err.message || err}`);
+    detected.error = String(err.message || err);
+  } finally {
+    stopWatcher();
+    try {
+      if (browser?.isConnected()) await browser.close();
+    } catch (_) {
+      /* ignore */
+    }
+    cleanup();
+  }
+
+  if (ASK && rl) {
+    await askChecklist(rl, id, results, detected);
+  } else {
+    const status = detected.error
+      ? "error"
+      : detected.cod_unavailable
+        ? detected.order_placed
+          ? "complete"
+          : "cod_unavailable"
+        : detected.order_placed
+          ? "complete"
+          : "pending";
+    results[id] = {
+      status,
+      order_placed: detected.order_placed,
+      cod_unavailable: !!detected.cod_unavailable,
+      evidence: detected.evidence || (detected.cod_unavailable ? "cod_unavailable" : null),
+      evidence_url: detected.evidence_url || null,
+      error: detected.error || null,
+      checked_at: new Date().toISOString(),
+      window_closed: true,
+    };
+    await saveResults(results);
+    logFor(
+      id,
+      `Saved: status=${results[id].status}, order_placed=${results[id].order_placed}`
+    );
+  }
+
+  return detected;
+}
+
 async function main() {
   const ids = readAccountIds();
   const results = readResults();
@@ -1436,139 +1605,39 @@ async function main() {
     ? readline.createInterface({ input: stdin, output: stdout })
     : null;
 
+  const cpuHint = Math.max(1, Math.min(4, (os.cpus() || []).length || 2));
   console.log(`Accounts to process: ${ids.length}`);
-  console.log("After all SKUs for an account, Chrome closes and the next account opens automatically.");
+  console.log(
+    `Concurrency: ${CONCURRENCY} parallel Chrome session(s)` +
+      (ASK ? " (--ask forces 1)" : ` (default 2; try --concurrency=${cpuHint} or 3)`)
+  );
+  console.log(`Start stagger: ${START_STAGGER_MS}ms between new sessions`);
+  console.log("Each account closes its own Chrome when done; pool picks up the next id.");
   console.log("If you reach an order-success screen, results will mark order_placed=true.");
   if (ASK) console.log("Checklist prompts enabled (--ask).\n");
   else console.log("Tip: use --ask for manual yes/no checklist between accounts.\n");
 
+  // Slot counter so tiled window positions stay unique across the pool
+  let slotSeq = 0;
+
   try {
-    for (let i = 0; i < ids.length; i++) {
-      const id = ids[i];
-      console.log(`\n=== [${i + 1}/${ids.length}] ${id} ===`);
-      let browser;
-      let cleanup = () => {};
-      const detected = {
-        order_placed: false,
-        evidence: null,
-        evidence_url: null,
-        cod_unavailable: false,
-      };
-      let stopWatcher = () => {};
-
-      try {
-        const session = await openFlipkartMobileSession(id);
-        browser = session.browser;
-        cleanup = session.cleanup || cleanup;
-        console.log(`Loaded ${session.cookieCount} cookies for ${session.accountId}`);
-
-        stopWatcher = attachOrderWatcher(browser, detected);
-
-        const context = browser.contexts()[0];
-        const page = context.pages()[0];
-
-        for (const product of PRODUCTS) {
-          console.log(`\n--- ${product.key} ---`);
-
-          if (page.isClosed()) {
-            console.log("Page closed — stopping products for this account.");
-            break;
-          }
-
-          let result;
-          try {
-            result = await inspectAndAddProduct(page, product);
-          } catch (err) {
-            if (/has been closed/i.test(String(err.message || err))) {
-              console.log("Browser/page closed during product — stopping this account.");
-              break;
-            }
-            result = {
-              status: "skipped",
-              reason: "error",
-              error: String(err.message || err),
-            };
-          }
-
-          console.log("Result:", result);
-
-          // No COD on payments → account already hit COD limit; close & next account
-          if (result.status === "account_done" || result.reason === "cod_unavailable") {
-            console.log(
-              "COD unavailable for this account (likely 3 orders already). Closing session…"
-            );
-            detected.cod_unavailable = true;
-            break;
-          }
-
-          // Skip wrong/suggested/unavailable items and keep going
-          if (result.status === "skipped") {
-            console.log("Continuing to next product…");
-            continue;
-          }
-
-          if (result.status === "continued" && !page.isClosed()) {
-            console.log(
-              result.order?.success
-                ? `Order signal for ${product.name}. Next SKU in 3s…`
-                : `Place Order attempted for ${product.name}. Next SKU in 3s…`
-            );
-            await page.waitForTimeout(3000).catch(() => {});
-          }
-        }
-
-        console.log("All products processed for this account — closing session…");
-        try {
-          if (browser?.isConnected()) await browser.close();
-        } catch (_) {
-          /* ignore */
-        }
-        cleanup();
-        cleanup = () => {};
-        console.log(
-          detected.cod_unavailable
-            ? "Session cleared (COD unavailable). Opening next account…"
-            : detected.order_placed
-              ? `Session cleared. Order placed (${detected.evidence}). Opening next account…`
-              : "Session cleared. No order-success page detected. Opening next account…"
-        );
-      } finally {
-        stopWatcher();
-        try {
-          if (browser?.isConnected()) await browser.close();
-        } catch (_) {
-          /* ignore */
-        }
-        cleanup();
+    await mapPool(ids, CONCURRENCY, async (id, index) => {
+      const slotIndex = slotSeq++;
+      // Stagger only the first wave of Chromes (pool refills start immediately)
+      if (START_STAGGER_MS > 0 && slotIndex < CONCURRENCY) {
+        await new Promise((r) => setTimeout(r, START_STAGGER_MS * slotIndex));
       }
-
-      if (ASK && rl) {
-        await askChecklist(rl, id, results, detected);
-      } else {
-        const status = detected.cod_unavailable
-          ? detected.order_placed
-            ? "complete"
-            : "cod_unavailable"
-          : detected.order_placed
-            ? "complete"
-            : "pending";
-        results[id] = {
-          status,
-          order_placed: detected.order_placed,
-          cod_unavailable: !!detected.cod_unavailable,
-          evidence: detected.evidence || (detected.cod_unavailable ? "cod_unavailable" : null),
-          evidence_url: detected.evidence_url || null,
-          checked_at: new Date().toISOString(),
-          window_closed: true,
-        };
-        saveResults(results);
-        console.log(
-          `Saved ${id}: status=${results[id].status}, order_placed=${results[id].order_placed}`
-        );
-      }
-    }
+      return processAccount(id, {
+        index,
+        total: ids.length,
+        slotIndex,
+        results,
+        rl,
+      });
+    });
   } finally {
     if (rl) rl.close();
+    await resultsWriteChain;
   }
 
   console.log(`\nAll accounts processed. Results: ${RESULTS_FILE}`);
