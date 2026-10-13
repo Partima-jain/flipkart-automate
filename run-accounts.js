@@ -1065,6 +1065,13 @@ async function selectCodAndPlaceOrder(page, { wantQty } = {}) {
     return { ok: true, how: "label" };
   });
 
+  const codInLabels = optionLabels.some((t) => /cash on\s*delivery/i.test(t));
+  const codBlockedCopy = await page
+    .getByText(/COD\s*(is\s*)?not available|not available for Cash on Delivery|Cash on Delivery.*(not available|unavailable)/i)
+    .first()
+    .isVisible({ timeout: 800 })
+    .catch(() => false);
+
   const codClicked = !!(codOpen && codOpen.ok);
   if (codClicked) {
     console.log(`Opened Cash on Delivery (${codOpen.how}).`);
@@ -1075,10 +1082,20 @@ async function selectCodAndPlaceOrder(page, { wantQty } = {}) {
       .waitFor({ state: "attached", timeout: 8000 })
       .catch(() => {});
   } else {
-    console.log("COD accordion not found on payments page.");
+    console.log("COD not available on payments page — treating account as done (likely 3 COD orders already).");
     await page
       .screenshot({ path: "debug-checkout-no-cod.png", fullPage: true })
       .catch(() => {});
+    return {
+      ok: false,
+      reason: "cod_unavailable",
+      accountDone: true,
+      url: page.url(),
+      codClicked: false,
+      optionLabels,
+      codInLabels,
+      codBlockedCopy,
+    };
   }
 
   // After expand: <button id="cod-place-order" data-testid="payButton">Place Order</button>
@@ -1116,9 +1133,11 @@ async function selectCodAndPlaceOrder(page, { wantQty } = {}) {
     await page
       .screenshot({ path: "debug-checkout-no-place-order.png", fullPage: true })
       .catch(() => {});
+    // COD row opened but Place Order missing → still treat as COD dead-end for this account
     return {
       ok: false,
-      reason: "place_order_not_found",
+      reason: "cod_unavailable",
+      accountDone: true,
       url: page.url(),
       codClicked,
       optionLabels,
@@ -1340,6 +1359,17 @@ async function inspectAndAddProduct(page, product) {
   console.log("COD / Place Order:", order);
 
   if (!order.ok) {
+    if (order.reason === "cod_unavailable" || order.accountDone) {
+      return {
+        status: "account_done",
+        reason: "cod_unavailable",
+        ctas,
+        quantity: qtyResult.quantity,
+        wantedQuantity: product.quantity,
+        finalUrl: order.url || afterUrl,
+        order,
+      };
+    }
     return {
       status: "skipped",
       reason: order.reason || "place_order_failed",
@@ -1422,6 +1452,7 @@ async function main() {
         order_placed: false,
         evidence: null,
         evidence_url: null,
+        cod_unavailable: false,
       };
       let stopWatcher = () => {};
 
@@ -1461,6 +1492,15 @@ async function main() {
 
           console.log("Result:", result);
 
+          // No COD on payments → account already hit COD limit; close & next account
+          if (result.status === "account_done" || result.reason === "cod_unavailable") {
+            console.log(
+              "COD unavailable for this account (likely 3 orders already). Closing session…"
+            );
+            detected.cod_unavailable = true;
+            break;
+          }
+
           // Skip wrong/suggested/unavailable items and keep going
           if (result.status === "skipped") {
             console.log("Continuing to next product…");
@@ -1486,9 +1526,11 @@ async function main() {
         cleanup();
         cleanup = () => {};
         console.log(
-          detected.order_placed
-            ? `Session cleared. Order placed (${detected.evidence}). Opening next account…`
-            : "Session cleared. No order-success page detected. Opening next account…"
+          detected.cod_unavailable
+            ? "Session cleared (COD unavailable). Opening next account…"
+            : detected.order_placed
+              ? `Session cleared. Order placed (${detected.evidence}). Opening next account…`
+              : "Session cleared. No order-success page detected. Opening next account…"
         );
       } finally {
         stopWatcher();
@@ -1503,10 +1545,18 @@ async function main() {
       if (ASK && rl) {
         await askChecklist(rl, id, results, detected);
       } else {
+        const status = detected.cod_unavailable
+          ? detected.order_placed
+            ? "complete"
+            : "cod_unavailable"
+          : detected.order_placed
+            ? "complete"
+            : "pending";
         results[id] = {
-          status: detected.order_placed ? "complete" : "pending",
+          status,
           order_placed: detected.order_placed,
-          evidence: detected.evidence || null,
+          cod_unavailable: !!detected.cod_unavailable,
+          evidence: detected.evidence || (detected.cod_unavailable ? "cod_unavailable" : null),
           evidence_url: detected.evidence_url || null,
           checked_at: new Date().toISOString(),
           window_closed: true,
