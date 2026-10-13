@@ -1,4 +1,6 @@
 node_modules/
 cookie.json
+account-results.json
 *.log
 .DS_Store
+

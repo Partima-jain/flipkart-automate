@@ -1,0 +1,122 @@
+
+const { chromium, devices } = require("playwright");
+const fs = require("fs");
+const path = require("path");
+const readline = require("readline/promises");
+const { stdin, stdout } = require("process");
+
+const COOKIE_FILE = path.join(__dirname, "cookie.json");
+const RESULTS_FILE = path.join(__dirname, "account-results.json");
+
+const rl = readline.createInterface({ input: stdin, output: stdout });
+
+function readAccounts() {
+  const data = JSON.parse(fs.readFileSync(COOKIE_FILE, "utf8"));
+  const accounts = Array.isArray(data.ids) ? data.ids : [];
+
+  if (!accounts.length) throw new Error("No accounts found.");
+  const ids = accounts.map((a) => a.id);
+
+  if (ids.some((id) => !id) || new Set(ids).size !== ids.length) {
+    throw new Error("Every account must have a unique, non-empty ID.");
+  }
+
+  // Only IDs are needed. Do not copy credentials or cookies into results.
+  return accounts.map(({ id }) => ({ id }));
+}
+
+function readResults() {
+  try {
+    return JSON.parse(fs.readFileSync(RESULTS_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveResults(results) {
+  fs.writeFileSync(RESULTS_FILE, JSON.stringify(results, null, 2));
+}
+
+async function waitForBrowserClose(browser) {
+  if (!browser.isConnected()) return;
+  await new Promise((resolve) => browser.once("disconnected", resolve));
+}
+
+async function main() {
+  const accounts = readAccounts();
+  const results = readResults();
+
+  try {
+    for (const account of accounts) {
+      console.log(`\n=== ${account.id} ===`);
+
+      const browser = await chromium.launch({
+        headless: false,
+      });
+
+      try {
+        const context = await browser.newContext({
+          ...devices["Pixel 7"],
+        });
+        const page = await context.newPage();
+
+        await page.goto("https://www.flipkart.com/viewcart", {
+          waitUntil: "domcontentloaded",
+        });
+
+        console.log("Sign in to the intended account in the browser.");
+        console.log("Verify the session, item, quantity, and total.");
+        console.log("Inspect checkout manually to see if COD is offered.");
+        console.log("Complete the order yourself if you choose.");
+        console.log("Close this browser window when finished.");
+
+        await waitForBrowserClose(browser);
+      } finally {
+        if (browser.isConnected()) await browser.close();
+      }
+
+      const order = await rl.question(
+        "Order confirmed? Enter 'complete' or 'pending': "
+      );
+      const status =
+        order.trim().toLowerCase() === "complete"
+          ? "complete"
+          : "pending";
+
+      const session = await rl.question(
+        "Was the account logged in and verified? (yes/no): "
+      );
+      const cart = await rl.question(
+        "Was the intended item verified in the cart? (yes/no): "
+      );
+      const cod = await rl.question(
+        "Was COD available? (yes/no/unknown): "
+      );
+
+      results[account.id] = {
+        status,
+        session_valid: session.trim().toLowerCase() === "yes",
+        cart_verified: cart.trim().toLowerCase() === "yes",
+        cod_available:
+          cod.trim().toLowerCase() === "yes"
+            ? true
+            : cod.trim().toLowerCase() === "no"
+              ? false
+              : null,
+        checked_at: new Date().toISOString(),
+      };
+
+      saveResults(results);
+      console.log(`Saved result for ${account.id}: ${status}`);
+    }
+  } finally {
+    rl.close();
+  }
+
+  console.log(`\nAll accounts processed. Results: ${RESULTS_FILE}`);
+}
+
+main().catch((err) => {
+  console.error(err.message || err);
+  process.exitCode = 1;
+});
