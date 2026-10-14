@@ -5,16 +5,20 @@
  *
  * Usage:
  *   node check-orders.js
+ *   node check-orders.js --concurrency=4   # fetch N accounts in parallel (default 4)
  *   node check-orders.js ananki148
- *   node check-orders.js --details          # also open each order detail page
- *   node check-orders.js --max=10
+ *   node check-orders.js --no-details      # skip order detail pages (no tracking IDs)
+ *   node check-orders.js --max=50          # cap detail pages per account (default: all open)
  *   node check-orders.js --from-json        # rebuild Excel from existing order-report.json
+ *   node check-orders.js --enrich          # only re-check accounts that already have orders
+ *   node check-orders.js --enrich --concurrency=8
  *   node check-orders.js --browse           # open 3 phone Chromes → Orders; next batch when all closed
  *   node check-orders.js --browse --batch=3 --cookie-file=cookie-pending.json
  */
 
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const XLSX = require("xlsx");
 const { openFlipkartMobileSession } = require("./lib/session");
 
@@ -30,23 +34,44 @@ const OUT_FILE = path.join(__dirname, "order-report.json");
 const EXCEL_FILE = path.join(__dirname, "order-report.xlsx");
 const ORDERS_URL = "https://www.flipkart.com/rv/orders?link=home_orders";
 
-const WANT_DETAILS = process.argv.includes("--details");
+// Detail pages required for tracking IDs — on by default; use --no-details to skip.
+const WANT_DETAILS = !process.argv.includes("--no-details");
 const FROM_JSON = process.argv.includes("--from-json");
 const BROWSE = process.argv.includes("--browse");
+const ENRICH = process.argv.includes("--enrich");
 const BATCH =
   parseInt(
     (process.argv.find((a) => a.startsWith("--batch=")) || "").split("=")[1] ||
-      (process.argv.find((a) => a.startsWith("--concurrency=")) || "").split(
-        "="
-      )[1] ||
       "3",
     10
   ) || 3;
-const MAX_DETAIL =
+
+function parseFetchConcurrency() {
+  const arg = process.argv.find((a) => a.startsWith("--concurrency="));
+  const raw = arg ? arg.split("=")[1] : process.env.CONCURRENCY;
+  // Enrich defaults higher — only accounts with orders
+  let n = parseInt(raw || (ENRICH ? "8" : "4"), 10);
+  if (!Number.isFinite(n) || n < 1) n = ENRICH ? 8 : 4;
+  const max =
+    Math.max(1, Math.min(10, parseInt(process.env.CONCURRENCY_MAX || "10", 10) || 10));
+  return Math.min(n, max);
+}
+
+const FETCH_CONCURRENCY = parseFetchConcurrency();
+const START_STAGGER_MS = Math.max(
+  0,
   parseInt(
-    (process.argv.find((a) => a.startsWith("--max=")) || "").split("=")[1] || "12",
+    process.env.START_STAGGER_MS || (ENRICH ? "300" : "800"),
     10
-  ) || 12;
+  ) || (ENRICH ? 300 : 800)
+);
+const MAX_DETAIL_ARG = (
+  process.argv.find((a) => a.startsWith("--max=")) || ""
+).split("=")[1];
+/** Cap detail fetches per account; default = all open (non-cancelled) orders. */
+const MAX_DETAIL = MAX_DETAIL_ARG
+  ? Math.max(1, parseInt(MAX_DETAIL_ARG, 10) || 1)
+  : Number.POSITIVE_INFINITY;
 const FILTER = process.argv
   .slice(2)
   .find((a) => a && !a.startsWith("--"));
@@ -230,6 +255,7 @@ function extractListOrders(json) {
         arriving = c.text;
       }
     }
+    arriving = pickBestArriving(arriving, extractArrivingFromText(blob));
     if (!arriving) {
       const m = blob.match(/Cancelled[^"\\]{0,48}/i);
       if (m) arriving = m[0];
@@ -254,13 +280,21 @@ function extractListOrders(json) {
 
     const product = productFromIcon(iconUrl, blob);
 
+    // List cards rarely include tracking; grab it when present.
+    const trackingFromList =
+      (blob.match(/"trackingId"\s*:\s*"([^"]+)"/i) || [])[1] ||
+      (blob.match(/\bFMP[A-Z0-9]{8,}\b/i) || [])[0] ||
+      null;
+
     orders.push({
       orderId,
       product,
       quantity,
       status: status ? String(status).replace(/\s+/g, " ").trim() : null,
       arriving: arriving ? String(arriving).replace(/\s+/g, " ").trim() : null,
-      trackingId: null,
+      trackingId: trackingFromList
+        ? String(trackingFromList).toUpperCase()
+        : null,
       unitId,
       itemId,
       detailPath: `/rv/orderDetails?order_id=${encodeURIComponent(orderId)}${
@@ -278,18 +312,72 @@ function extractListOrders(json) {
   return [...map.values()];
 }
 
+function extractTrackingId(text) {
+  if (!text) return null;
+  const key = text.match(/"trackingId"\s*:\s*"([^"]+)"/i);
+  if (key?.[1] && !/^OD\d/i.test(key[1]) && key[1].length >= 8) {
+    return String(key[1]).toUpperCase();
+  }
+  const fmp = text.match(/\bFMP[A-Z0-9]{8,}\b/i);
+  if (fmp) return String(fmp[0]).toUpperCase();
+  const labeled = text.match(
+    /tracking(?:\s*id)?["\s:=\-]+["']?([A-Z0-9]{8,})/i
+  );
+  if (labeled?.[1] && !/^OD\d/i.test(labeled[1])) {
+    return String(labeled[1]).toUpperCase();
+  }
+  return null;
+}
+
+/** Pull delivery / arriving line from free text (API or DOM). */
+function extractArrivingFromText(text) {
+  if (!text) return null;
+  const patterns = [
+    /Delivery expected by[^"\\.]{0,60}/i,
+    /Arriving tomorrow(?:\s+by\s+[^"\\.]{0,40})?/i,
+    /Arriving today(?:\s+by\s+[^"\\.]{0,40})?/i,
+    /Arriving(?:\s+by)?\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}[^"\\.]{0,40}/i,
+    /Delivered on[^"\\.]{0,60}/i,
+    /Cancelled(?:\s+Today)?(?:,?\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})?[^"\\.]{0,40}/i,
+  ];
+  for (const re of patterns) {
+    const m = String(text).match(re);
+    if (m) return m[0].replace(/\s+/g, " ").trim();
+  }
+  return null;
+}
+
+/** Prefer the more specific / fresher arriving string. */
+function pickBestArriving(...candidates) {
+  const scored = candidates
+    .filter(Boolean)
+    .map((raw) => {
+      const s = String(raw).replace(/\s+/g, " ").trim();
+      let score = 0;
+      if (/Delivery expected by/i.test(s)) score += 5;
+      if (/Arriving tomorrow|Arriving today/i.test(s)) score += 4;
+      if (/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}/i.test(s))
+        score += 3;
+      if (/\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b/i.test(s)) score += 1;
+      if (/by\s+\d/i.test(s)) score += 1;
+      if (/Delivered on/i.test(s)) score += 2;
+      if (/cancel/i.test(s)) score += 2;
+      score += Math.min(s.length, 40) / 100;
+      return { s, score };
+    })
+    .sort((a, b) => b.score - a.score);
+  return scored[0]?.s || null;
+}
+
 function extractDetailFields(json) {
   const text = JSON.stringify(json);
   const orderId = (text.match(/OD\d{10,}/) || [])[0] || null;
-  const trackingKey = text.match(/"trackingId"\s*:\s*"([^"]+)"/i);
-  const trackingId =
-    (trackingKey && trackingKey[1]) ||
-    (text.match(/\bFMP[A-Z0-9]{8,}\b/i) || [])[0] ||
-    null;
+  const trackingId = extractTrackingId(text);
 
   let product = null;
-  let arriving = null;
+  let arriving = extractArrivingFromText(text);
   let status = null;
+  const arrivingCandidates = arriving ? [arriving] : [];
 
   function walk(n, d = 0) {
     if (!n || d > 22) return;
@@ -305,12 +393,14 @@ function extractDetailFields(json) {
       ) {
         product = s;
       }
-      if (!arriving && /Delivery expected by|Delivered on|Arriving|Cancelled/i.test(s)) {
-        arriving = s;
+      if (/Delivery expected by|Delivered on|Arriving|Cancelled/i.test(s) && s.length < 120) {
+        arrivingCandidates.push(s);
       }
       if (
         !status &&
-        /Order has been placed|Shipped|Out for delivery|Delivered|Cancelled|canceled/i.test(s)
+        /Order has been placed|Shipped|Out for delivery|Delivered|Cancelled|canceled|packed|dispatched/i.test(
+          s
+        )
       ) {
         status = s;
       }
@@ -332,12 +422,20 @@ function extractDetailFields(json) {
     orderId,
     trackingId: trackingId ? String(trackingId).toUpperCase() : null,
     product: cleanProduct(product),
-    arriving,
+    arriving: pickBestArriving(...arrivingCandidates),
     status,
   };
 }
 
-function waitForRomeFetch(page, { timeoutMs = 15000, preferOds = true } = {}) {
+function waitForRomeFetch(
+  page,
+  {
+    timeoutMs = 15000,
+    preferOds = true,
+    preferTracking = false,
+    preferDetail = false,
+  } = {}
+) {
   const hits = [];
   const onResponse = async (res) => {
     try {
@@ -346,25 +444,60 @@ function waitForRomeFetch(page, { timeoutMs = 15000, preferOds = true } = {}) {
       const json = await res.json();
       const text = JSON.stringify(json);
       const ods = [...new Set(text.match(/OD\d{10,}/g) || [])];
-      hits.push({ json, len: text.length, ods });
+      const trackingId = extractTrackingId(text);
+      const arriving = extractArrivingFromText(text);
+      hits.push({ json, len: text.length, ods, trackingId, arriving, text });
     } catch (_) {
       /* ignore */
     }
   };
   page.on("response", onResponse);
 
+  const pickBest = () => {
+    if (!hits.length) return null;
+    if (preferDetail || preferTracking) {
+      // Prefer payload that has tracking and/or a delivery line; then largest.
+      return [...hits].sort((a, b) => {
+        const sa =
+          (a.trackingId ? 10 : 0) + (a.arriving ? 6 : 0) + Math.min(a.len, 50000) / 100000;
+        const sb =
+          (b.trackingId ? 10 : 0) + (b.arriving ? 6 : 0) + Math.min(b.len, 50000) / 100000;
+        return sb - sa;
+      })[0];
+    }
+    if (preferOds) {
+      return [...hits]
+        .filter((h) => h.ods.length)
+        .sort((a, b) => b.ods.length - a.ods.length || b.len - a.len)[0] ||
+        [...hits].sort((a, b) => b.len - a.len)[0];
+    }
+    return [...hits].sort((a, b) => b.len - a.len)[0];
+  };
+
   const done = (async () => {
     const start = Date.now();
+    let readyAt = 0;
     while (Date.now() - start < timeoutMs) {
-      if (preferOds) {
-        const withOd = hits.filter((h) => h.ods.length).sort((a, b) => b.ods.length - a.ods.length);
-        if (withOd[0]) return withOd[0];
+      if (preferDetail || preferTracking) {
+        const good = hits.find((h) => h.trackingId && h.arriving);
+        if (good) {
+          // Brief settle so late fields can still arrive
+          if (!readyAt) readyAt = Date.now();
+          if (Date.now() - readyAt >= 400) return pickBest();
+        } else if (hits.some((h) => h.trackingId || h.arriving)) {
+          if (!readyAt) readyAt = Date.now();
+          // Wait a bit longer for the other field
+          if (Date.now() - readyAt >= 1200) return pickBest();
+        }
+      } else if (preferOds) {
+        const withOd = hits.filter((h) => h.ods.length);
+        if (withOd[0]) return pickBest();
       } else if (hits.length) {
-        return hits.sort((a, b) => b.len - a.len)[0];
+        return pickBest();
       }
-      await page.waitForTimeout(200);
+      await page.waitForTimeout(150);
     }
-    return hits.sort((a, b) => b.ods.length - a.ods.length || b.len - a.len)[0] || null;
+    return pickBest();
   })();
 
   return {
@@ -372,13 +505,64 @@ function waitForRomeFetch(page, { timeoutMs = 15000, preferOds = true } = {}) {
   };
 }
 
-async function fetchOrdersForAccount(accountId) {
+/** DOM scrape for tracking + delivery line on order detail page. */
+async function scrapeDetailDom(page) {
+  return page.evaluate(() => {
+    const t = (document.body?.innerText || "").replace(/\s+/g, " ");
+    let trackingId = null;
+    const fmp = t.match(/\bFMP[A-Z0-9]{8,}\b/i);
+    if (fmp) trackingId = fmp[0];
+    if (!trackingId) {
+      const labeled = t.match(/Tracking\s*ID\s*[:\-]?\s*([A-Z0-9]{8,})/i);
+      if (labeled) trackingId = labeled[1];
+    }
+    let arriving = null;
+    const a =
+      t.match(/Delivery expected by[^.]{0,60}/i) ||
+      t.match(/Arriving tomorrow(?:\s+by\s+[^.]{0,40})?/i) ||
+      t.match(/Arriving today(?:\s+by\s+[^.]{0,40})?/i) ||
+      t.match(/Arriving(?:\s+by)?\s+[A-Za-z]{0,9}\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}[^.]{0,40}/i) ||
+      t.match(/Delivered on[^.]{0,60}/i);
+    if (a) arriving = a[0].trim();
+    let status = null;
+    const st = t.match(
+      /(?:Order has been placed|Shipped|Out for delivery|Delivered|Cancelled|Packed|Dispatched)[^.!]{0,80}/i
+    );
+    if (st) status = st[0].trim();
+    return { trackingId, arriving, status };
+  });
+}
+
+/** Run up to `concurrency` async workers over items (pool, not all-at-once). */
+async function mapPool(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+
+  async function run() {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await worker(items[i], i);
+    }
+  }
+
+  const n = Math.min(Math.max(1, concurrency), items.length || 1);
+  await Promise.all(Array.from({ length: n }, () => run()));
+  return results;
+}
+
+function logFor(id, ...args) {
+  console.log(`[${id}]`, ...args);
+}
+
+async function fetchOrdersForAccount(accountId, { slotIndex = 0 } = {}) {
   let browser;
   let cleanup = () => {};
 
   try {
     const session = await openFlipkartMobileSession(accountId, {
       cookieFile: COOKIE_FILE,
+      slotIndex,
     });
     browser = session.browser;
     cleanup = session.cleanup || cleanup;
@@ -396,8 +580,9 @@ async function fetchOrdersForAccount(accountId) {
       );
       const expected = (body.match(/Delivery expected by/gi) || []).length;
       const cancelled = (body.match(/\bCancelled\b/gi) || []).length;
-      console.log(
-        `  Rome list payload missing ODs (dom hints: expected=${expected}, cancelled=${cancelled}).`
+      logFor(
+        accountId,
+        `Rome list payload missing ODs (dom hints: expected=${expected}, cancelled=${cancelled}).`
       );
       return {
         accountId,
@@ -410,28 +595,108 @@ async function fetchOrdersForAccount(accountId) {
     }
 
     let orders = extractListOrders(listHit.json);
-    console.log(`  List API: ${orders.length} order card(s).`);
+    logFor(accountId, `List API: ${orders.length} order card(s).`);
 
+    // Always open every open order detail — refresh delivery date + tracking.
     if (WANT_DETAILS && orders.length) {
-      for (const o of orders.slice(0, MAX_DETAIL)) {
-        const detailWait = waitForRomeFetch(page, { timeoutMs: 12000, preferOds: false });
+      const needDetail = orders.filter((o) => !isCancelled(o) && !isDelivered(o));
+      const toFetch = needDetail.slice(
+        0,
+        Number.isFinite(MAX_DETAIL) ? MAX_DETAIL : needDetail.length
+      );
+      logFor(
+        accountId,
+        `Detail verify (delivery + tracking): ${toFetch.length} open order(s)`
+      );
+
+      for (const o of toFetch) {
+        const listArriving = o.arriving;
+        const detailWait = waitForRomeFetch(page, {
+          timeoutMs: 16000,
+          preferOds: false,
+          preferDetail: true,
+        });
         const url = "https://www.flipkart.com" + o.detailPath;
         try {
-          await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-          await page.waitForTimeout(2500);
+          await page.goto(url, {
+            waitUntil: "domcontentloaded",
+            timeout: 45000,
+          });
+          await page.waitForTimeout(900);
           const detailHit = await detailWait.promise;
           if (detailHit) {
             const d = extractDetailFields(detailHit.json);
             o.product = cleanProduct(d.product) || o.product;
-            o.arriving = d.arriving || o.arriving;
+            o.arriving = pickBestArriving(
+              d.arriving,
+              detailHit.arriving,
+              listArriving,
+              o.arriving
+            );
             o.status = d.status || o.status;
-            o.trackingId = d.trackingId || o.trackingId;
+            o.trackingId =
+              d.trackingId || detailHit.trackingId || o.trackingId || null;
             o.source = "rome_list+detail";
           }
+
+          // Always DOM-scrape as second source (catches UI-only updates)
+          const dom = await scrapeDetailDom(page).catch(() => null);
+          if (dom) {
+            o.arriving = pickBestArriving(dom.arriving, o.arriving, listArriving);
+            if (dom.status) o.status = dom.status || o.status;
+            if (dom.trackingId) {
+              o.trackingId = String(dom.trackingId).toUpperCase();
+              if (!o.source || o.source === "rome_list") {
+                o.source = "rome_list+detail_dom";
+              }
+            }
+          }
+
+          // One retry if still missing tracking on a likely-shipped order
+          const likelyShipped =
+            /arriv|expected|ship|out for|dispatch|pack/i.test(
+              `${o.arriving || ""} ${o.status || ""}`
+            );
+          if (!o.trackingId && likelyShipped) {
+            await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 }).catch(
+              () => {}
+            );
+            await page.waitForTimeout(1200);
+            const retryWait = waitForRomeFetch(page, {
+              timeoutMs: 10000,
+              preferDetail: true,
+            });
+            const retryHit = await retryWait.promise;
+            if (retryHit) {
+              const d = extractDetailFields(retryHit.json);
+              o.arriving = pickBestArriving(
+                d.arriving,
+                retryHit.arriving,
+                o.arriving
+              );
+              o.trackingId =
+                d.trackingId || retryHit.trackingId || o.trackingId || null;
+              o.status = d.status || o.status;
+            }
+            const dom2 = await scrapeDetailDom(page).catch(() => null);
+            if (dom2) {
+              o.arriving = pickBestArriving(dom2.arriving, o.arriving);
+              if (dom2.trackingId) {
+                o.trackingId = String(dom2.trackingId).toUpperCase();
+              }
+            }
+          }
         } catch (err) {
-          console.log(`  Detail failed ${o.orderId}: ${err.message || err}`);
+          logFor(accountId, `Detail failed ${o.orderId}: ${err.message || err}`);
         }
       }
+      const open = orders.filter((o) => !isCancelled(o) && !isDelivered(o));
+      const withTrack = open.filter((o) => o.trackingId).length;
+      const withDate = open.filter((o) => o.arriving).length;
+      logFor(
+        accountId,
+        `Open orders: ${open.length} | delivery dates ${withDate} | tracking ${withTrack}`
+      );
     }
 
     orders = orders.map((o) => ({
@@ -492,6 +757,65 @@ function isMobile(order) {
 
 function isTab(order) {
   return /tab\s*a11|galaxy\s*tab|TABHHQEY/i.test(order.product || "");
+}
+
+const USAGE_TARGET = 3;
+
+/** Successful mobile + tab order cards (tab ×2 qty = 1 card). Cancelled excluded. */
+function mobileTabSuccessCount(orders) {
+  let n = 0;
+  for (const o of orders || []) {
+    if (isCancelled(o)) continue;
+    if (isMobile(o) || isTab(o)) n += 1;
+  }
+  return n;
+}
+
+/**
+ * unused = 0, half_used = 1..2, complete = >= 3 (mobile+tab success).
+ */
+function usageLabel(count) {
+  if (count <= 0) return "unused";
+  if (count < USAGE_TARGET) return "half_used";
+  return "complete";
+}
+
+function buildUsageBuckets(reports) {
+  const unused = [];
+  const half = [];
+  const complete = [];
+
+  for (const report of reports) {
+    const orders = report.orders || [];
+    let mobileSuccess = 0;
+    let tabSuccess = 0;
+    for (const o of orders) {
+      if (isCancelled(o)) continue;
+      if (isMobile(o)) mobileSuccess += 1;
+      else if (isTab(o)) tabSuccess += 1;
+    }
+    const mobileTab = mobileSuccess + tabSuccess;
+    const row = {
+      "Mail ID": report.accountId || "",
+      "Mobile+Tab orders": mobileTab,
+      Mobile: mobileSuccess,
+      Tab: tabSuccess,
+      Needed: Math.max(0, USAGE_TARGET - mobileTab),
+      Usage: usageLabel(mobileTab),
+    };
+    if (mobileTab <= 0) unused.push(row);
+    else if (mobileTab < USAGE_TARGET) half.push(row);
+    else complete.push(row);
+  }
+
+  const sortFn = (a, b) =>
+    a["Mobile+Tab orders"] - b["Mobile+Tab orders"] ||
+    String(a["Mail ID"]).localeCompare(String(b["Mail ID"]));
+  unused.sort(sortFn);
+  half.sort(sortFn);
+  complete.sort(sortFn);
+
+  return { unused, half, complete };
 }
 
 /**
@@ -582,11 +906,88 @@ function outcome(order) {
   return isCancelled(order) ? "Cancelled" : "Success";
 }
 
+const MONTH_NAMES = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+
+/** Calendar day in Asia/Kolkata for report "today" (Flipkart relative dates). */
+function reportRefDate(checkedAt) {
+  const d = checkedAt ? new Date(checkedAt) : new Date();
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+  }).formatToParts(d);
+  const get = (t) => Number(parts.find((p) => p.type === t)?.value);
+  return new Date(get("year"), get("month") - 1, get("day"));
+}
+
+function formatMonthDay(date) {
+  return `${MONTH_NAMES[date.getMonth()]} ${String(date.getDate()).padStart(2, "0")}`;
+}
+
+/**
+ * Resolve arriving text → { month, day, year } including relative
+ * "today" / "tomorrow" (e.g. "Arriving tomorrow by 11 pm").
+ */
+function resolveArrivingDate(order, refDate) {
+  if (isCancelled(order) || isDelivered(order)) return null;
+  const raw = String(order.arriving || "").replace(/\s+/g, " ").trim();
+  if (!raw || /cancel/i.test(raw)) return null;
+
+  const base = refDate instanceof Date ? refDate : reportRefDate();
+
+  if (/\btoday\b/i.test(raw)) {
+    return {
+      month: MONTH_NAMES[base.getMonth()],
+      day: base.getDate(),
+      year: base.getFullYear(),
+    };
+  }
+  if (/\btomorrow\b/i.test(raw)) {
+    const t = new Date(base);
+    t.setDate(t.getDate() + 1);
+    return {
+      month: MONTH_NAMES[t.getMonth()],
+      day: t.getDate(),
+      year: t.getFullYear(),
+    };
+  }
+
+  const m = raw.match(
+    /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})(?:,?\s*(\d{4}))?\b/i
+  );
+  if (!m) return null;
+  return {
+    month: m[1],
+    day: Number(m[2]),
+    year: m[3] ? Number(m[3]) : base.getFullYear(),
+  };
+}
+
 /** Normalize arriving text → bucket key for delivery-date pivots. */
-function deliveryBucket(order) {
+function deliveryBucket(order, refDate) {
   const raw = String(order.arriving || "").replace(/\s+/g, " ").trim();
   if (isCancelled(order) || /^cancel/i.test(raw)) return "Cancelled";
   if (!raw) return "Unknown / not set";
+
+  // Resolve today/tomorrow to a real calendar date for Excel sheets
+  const resolved = resolveArrivingDate(order, refDate);
+  if (resolved && /\b(today|tomorrow)\b/i.test(raw)) {
+    return `Expected: ${resolved.month} ${resolved.day}`;
+  }
 
   let m = raw.match(/Delivery expected by\s+(.+?)(?:\.|$)/i);
   if (m) return `Expected: ${m[1].trim()}`;
@@ -613,12 +1014,12 @@ function deliverySortKey(label) {
 }
 
 /** Phone / tab counts per expected delivery date (tab qty 2 = 1 order). */
-function buildByDeliveryDate(reports) {
+function buildByDeliveryDate(reports, refDate) {
   const map = new Map();
   for (const report of reports) {
     for (const o of report.orders || []) {
       if (isDelivered(o)) continue;
-      const key = deliveryBucket(o);
+      const key = deliveryBucket(o, refDate);
       if (!map.has(key)) {
         map.set(key, { "Delivery / expected": key, Phones: 0, Tabs: 0, Other: 0 });
       }
@@ -643,15 +1044,11 @@ function buildByDeliveryDate(reports) {
     );
 }
 
-/** Parse month + day from arriving / bucket text (e.g. "Tomorrow, Oct 14", "Fri Oct 16"). */
-function parseArrivingMonthDay(order) {
-  const raw = `${order.arriving || ""} ${deliveryBucket(order)}`;
-  if (isCancelled(order) || /cancel/i.test(raw)) return null;
-  const m = raw.match(
-    /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\b/i
-  );
-  if (!m) return null;
-  return { month: m[1], day: Number(m[2]) };
+/** Parse month + day from arriving text (absolute or today/tomorrow). */
+function parseArrivingMonthDay(order, refDate) {
+  const resolved = resolveArrivingDate(order, refDate);
+  if (!resolved) return null;
+  return { month: resolved.month, day: resolved.day };
 }
 
 function deviceLabel(order) {
@@ -660,24 +1057,29 @@ function deviceLabel(order) {
   return "Other";
 }
 
+/** Oct days to split into dedicated Excel sheets (today through Oct 20). */
+const ARRIVING_OCT_DAYS = [14, 15, 16, 17, 18, 19, 20];
+
 /**
  * Rows for a target calendar day (month + day), non-cancelled only.
- * Columns: Mail ID, Tracking ID, Delivery expected, Device.
  */
-function buildArrivingDayRows(reports, month, day) {
+function buildArrivingDayRows(reports, month, day, refDate) {
   const monthRe = new RegExp(`^${month}$`, "i");
   const rows = [];
   for (const report of reports) {
     for (const o of report.orders || []) {
       if (isCancelled(o) || isDelivered(o)) continue;
-      const md = parseArrivingMonthDay(o);
+      const md = parseArrivingMonthDay(o, refDate);
       if (!md || !monthRe.test(md.month) || md.day !== day) continue;
       rows.push({
         "Mail ID": report.accountId || "",
-        "Tracking ID": o.trackingId || "",
-        "Delivery expected": o.arriving || deliveryBucket(o),
-        Device: deviceLabel(o),
         "Order ID": o.orderId || "",
+        "Tracking ID": o.trackingId || "",
+        "Delivery expected": o.arriving || deliveryBucket(o, refDate),
+        Device: deviceLabel(o),
+        Product: o.product || "",
+        Qty: o.quantity ?? 1,
+        Status: o.status || "",
       });
     }
   }
@@ -685,6 +1087,19 @@ function buildArrivingDayRows(reports, month, day) {
     String(a["Mail ID"]).localeCompare(String(b["Mail ID"])) ||
     String(a["Order ID"]).localeCompare(String(b["Order ID"]))
   );
+  return rows;
+}
+
+function buildArrivingRangeRows(reports, month, days, refDate) {
+  const daySet = new Set(days);
+  const rows = [];
+  for (const day of days) {
+    for (const r of buildArrivingDayRows(reports, month, day, refDate)) {
+      rows.push({ Day: `${month} ${day}`, ...r });
+    }
+  }
+  // keep day order already from loop; ignore unused daySet lint
+  void daySet;
   return rows;
 }
 
@@ -697,14 +1112,29 @@ function writeExcelReport(payload) {
   }));
   const stats = buildSummary(reportsOpen);
   const checkedAt = payload.checked_at || new Date().toISOString();
-  const byDelivery = buildByDeliveryDate(reportsOpen);
-  const arrivingOct14 = buildArrivingDayRows(reportsOpen, "Oct", 14);
-  const arrivingOct15 = buildArrivingDayRows(reportsOpen, "Oct", 15);
-  const arrivingOct16 = buildArrivingDayRows(reportsOpen, "Oct", 16);
+  const refDate = reportRefDate(checkedAt);
+  const byDelivery = buildByDeliveryDate(reportsOpen, refDate);
+  const arrivingByDay = ARRIVING_OCT_DAYS.map((day) => ({
+    day,
+    sheet: `Oct ${day}`,
+    rows: buildArrivingDayRows(reportsOpen, "Oct", day, refDate),
+  }));
+  const arrivingRange = buildArrivingRangeRows(
+    reportsOpen,
+    "Oct",
+    ARRIVING_OCT_DAYS,
+    refDate
+  );
+  // Full history (incl. delivered) for usage: unused / half / complete
+  const usage = buildUsageBuckets(reports);
 
   const summaryRows = [
     { Field: "Checked at", Value: checkedAt },
-    { Field: "Note", Value: "Delivered orders excluded from this Excel" },
+    {
+      Field: "Report day (IST)",
+      Value: `${formatMonthDay(refDate)} ${refDate.getFullYear()} (today/tomorrow resolved from this)`,
+    },
+    { Field: "Note", Value: "Delivered orders excluded from order sheets; usage uses all success mobile+tab" },
     { Field: "Accounts", Value: stats.accounts },
     { Field: "Total orders", Value: stats.total_orders },
     { Field: "Mobile orders", Value: stats.mobile?.orders ?? 0 },
@@ -715,6 +1145,24 @@ function writeExcelReport(payload) {
     { Field: "Tab cancelled", Value: stats.tab?.cancelled ?? 0 },
     { Field: "Overall success", Value: stats.success ?? 0 },
     { Field: "Overall cancelled", Value: stats.cancelled ?? 0 },
+    { Field: "", Value: "" },
+    {
+      Field: "— Account usage (mobile+tab success, tab×2=1, target 3) —",
+      Value: "cancelled excluded",
+    },
+    { Field: "Unused (=0)", Value: usage.unused.length },
+    { Field: "Half used (1–2)", Value: usage.half.length },
+    { Field: "Complete used (>=3)", Value: usage.complete.length },
+    { Field: "", Value: "" },
+    { Field: "— Arriving Oct 14–20 —", Value: "open orders only" },
+    ...arrivingByDay.map(({ sheet, rows }) => ({
+      Field: sheet,
+      Value: rows.length,
+    })),
+    {
+      Field: "Oct 14–20 total",
+      Value: arrivingRange.length,
+    },
     { Field: "", Value: "" },
     { Field: "— By expected delivery —", Value: "Phones | Tabs" },
     ...byDelivery.map((r) => ({
@@ -753,7 +1201,7 @@ function writeExcelReport(payload) {
         Status: o.status || "",
         Outcome: outcome(o),
         Arriving: o.arriving || "",
-        "Delivery bucket": deliveryBucket(o),
+        "Delivery bucket": deliveryBucket(o, refDate),
         "Tracking ID": o.trackingId || "",
         Checked: report.checked_at || checkedAt,
       });
@@ -772,11 +1220,14 @@ function writeExcelReport(payload) {
       if (isMobile(o)) mobile += 1;
       else if (isTab(o)) tab += 1;
     }
+    const mobileTab = mobileTabSuccessCount(report.orders || []);
     return {
       Account: report.accountId || "",
       "Total orders": orders.length,
       Mobile: mobile,
       Tab: tab,
+      "Mobile+Tab success": mobileTab,
+      Usage: usageLabel(mobileTab),
       Success: success,
       Cancelled: cancelled,
       OK: report.ok === false ? "error" : "ok",
@@ -784,31 +1235,71 @@ function writeExcelReport(payload) {
     };
   });
 
-  const emptyDay = [{ "Mail ID": "", "Tracking ID": "", "Delivery expected": "(none)", Device: "", "Order ID": "" }];
+  const emptyDay = [
+    {
+      "Mail ID": "",
+      "Order ID": "",
+      "Tracking ID": "",
+      "Delivery expected": "(none)",
+      Device: "",
+      Product: "",
+      Qty: "",
+      Status: "",
+    },
+  ];
 
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), "Summary");
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(byDelivery), "By Delivery Date");
   XLSX.utils.book_append_sheet(
     wb,
-    XLSX.utils.json_to_sheet(arrivingOct14.length ? arrivingOct14 : emptyDay),
-    "Oct 14"
+    XLSX.utils.json_to_sheet(arrivingRange.length ? arrivingRange : [{ Day: "", ...emptyDay[0] }]),
+    "Oct 14-20"
   );
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.json_to_sheet(arrivingOct15.length ? arrivingOct15 : emptyDay),
-    "Oct 15"
-  );
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.json_to_sheet(arrivingOct16.length ? arrivingOct16 : emptyDay),
-    "Oct 16"
-  );
+  for (const { sheet, rows } of arrivingByDay) {
+    XLSX.utils.book_append_sheet(
+      wb,
+      XLSX.utils.json_to_sheet(rows.length ? rows : emptyDay),
+      sheet
+    );
+  }
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(orderRows), "Orders");
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(byAccountRows), "By Account");
+
+  const emptyUsage = [
+    {
+      "Mail ID": "",
+      "Mobile+Tab orders": "",
+      Mobile: "",
+      Tab: "",
+      Needed: "",
+      Usage: "(none)",
+    },
+  ];
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet(usage.unused.length ? usage.unused : emptyUsage),
+    "Unused IDs"
+  );
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet(usage.half.length ? usage.half : emptyUsage),
+    "Half Used IDs"
+  );
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet(usage.complete.length ? usage.complete : emptyUsage),
+    "Complete Used IDs"
+  );
+
   XLSX.writeFile(wb, EXCEL_FILE);
   console.log(
-    `Arriving sheets: Oct 14=${arrivingOct14.length}, Oct 15=${arrivingOct15.length}, Oct 16=${arrivingOct16.length}`
+    "Arriving sheets: " +
+      arrivingByDay.map(({ sheet, rows }) => `${sheet}=${rows.length}`).join(", ") +
+      ` | Oct 14-20 total=${arrivingRange.length}`
+  );
+  console.log(
+    `Usage: unused=${usage.unused.length}, half=${usage.half.length}, complete=${usage.complete.length}`
   );
   return EXCEL_FILE;
 }
@@ -858,47 +1349,61 @@ function payloadFromExcel(excelPath = EXCEL_FILE) {
   };
 }
 
-async function main() {
-  if (FROM_JSON) {
-    let payload;
-    if (fs.existsSync(OUT_FILE)) {
-      payload = JSON.parse(fs.readFileSync(OUT_FILE, "utf8"));
-    } else if (fs.existsSync(EXCEL_FILE)) {
-      console.log(`No ${path.basename(OUT_FILE)} — rebuilding from ${path.basename(EXCEL_FILE)}`);
-      payload = payloadFromExcel(EXCEL_FILE);
-    } else {
-      throw new Error(`No ${OUT_FILE} or ${EXCEL_FILE} — run a full check first.`);
+function loadExistingPayload() {
+  if (fs.existsSync(OUT_FILE)) {
+    return JSON.parse(fs.readFileSync(OUT_FILE, "utf8"));
+  }
+  if (fs.existsSync(EXCEL_FILE)) {
+    console.log(`No ${path.basename(OUT_FILE)} — loading from ${path.basename(EXCEL_FILE)}`);
+    return payloadFromExcel(EXCEL_FILE);
+  }
+  return null;
+}
+
+function mergeReports(baseReports, freshReports) {
+  const byId = new Map((baseReports || []).map((r) => [r.accountId, r]));
+  for (const fresh of freshReports) {
+    const prev = byId.get(fresh.accountId);
+    if (!fresh.ok && prev) {
+      // Keep previous good data if enrich failed
+      byId.set(fresh.accountId, {
+        ...prev,
+        enrich_error: fresh.error,
+        enrich_attempted_at: fresh.checked_at,
+      });
+      continue;
     }
-    const excelPath = writeExcelReport(payload);
-    printSummary(payload.summary || buildSummary(payload.reports || []));
-    console.log(`Excel saved: ${excelPath}`);
-    return;
+    if (fresh.ok && (!fresh.orders || !fresh.orders.length) && prev?.orders?.length) {
+      // Unexpected empty — keep previous, flag it
+      byId.set(fresh.accountId, {
+        ...prev,
+        enrich_note: "re-fetch returned 0 orders; kept previous",
+        enrich_attempted_at: fresh.checked_at,
+      });
+      continue;
+    }
+    // Merge: keep best delivery date + never drop a known tracking id
+    if (prev?.orders?.length && fresh.orders?.length) {
+      const prevByOd = new Map(prev.orders.map((o) => [o.orderId, o]));
+      fresh.orders = fresh.orders.map((o) => {
+        const old = prevByOd.get(o.orderId);
+        if (!old) return o;
+        return {
+          ...o,
+          trackingId: o.trackingId || old.trackingId || null,
+          product: o.product || old.product || null,
+          arriving: pickBestArriving(o.arriving, old.arriving),
+          status: o.status || old.status || null,
+        };
+      });
+    }
+    byId.set(fresh.accountId, fresh);
   }
+  return [...byId.values()];
+}
 
-  const ids = readAccountIds();
-
-  if (BROWSE) {
-    await runBrowseBatches(ids);
-    return;
-  }
-
-  console.log(`Checking orders for ${ids.length} account(s)…`);
-  if (WANT_DETAILS) console.log("Detail pages enabled (--details).");
-  console.log(`Report → ${OUT_FILE}`);
-  console.log(`Excel  → ${EXCEL_FILE}\n`);
-
-  const reports = [];
-  for (let i = 0; i < ids.length; i++) {
-    const id = ids[i];
-    console.log(`[${i + 1}/${ids.length}] ${id}`);
-    const report = await fetchOrdersForAccount(id);
-    reports.push(report);
-    printAccount(report);
-  }
-
+function writePayload(reports, { enrich = false } = {}) {
   const stats = buildSummary(reports);
-  printSummary(stats);
-
   const summary = {
     checked_at: new Date().toISOString(),
     summary: stats,
@@ -908,12 +1413,131 @@ async function main() {
     tab: stats.tab,
     success: stats.success,
     cancelled: stats.cancelled,
+    enrich: enrich || undefined,
     reports,
   };
   fs.writeFileSync(OUT_FILE, JSON.stringify(summary, null, 2));
+  return summary;
+}
+
+async function main() {
+  if (FROM_JSON) {
+    const payload = loadExistingPayload();
+    if (!payload) {
+      throw new Error(`No ${OUT_FILE} or ${EXCEL_FILE} — run a full check first.`);
+    }
+    const excelPath = writeExcelReport(payload);
+    printSummary(payload.summary || buildSummary(payload.reports || []));
+    console.log(`Excel saved: ${excelPath}`);
+    return;
+  }
+
+  if (BROWSE) {
+    await runBrowseBatches(readAccountIds());
+    return;
+  }
+
+  let ids = readAccountIds();
+  let existingPayload = null;
+
+  if (ENRICH) {
+    existingPayload = loadExistingPayload();
+    if (!existingPayload?.reports?.length) {
+      throw new Error("--enrich needs an existing order-report.json (run a full check first).");
+    }
+    const withOrders = new Set(
+      existingPayload.reports
+        .filter((r) => (r.orders || []).length > 0)
+        .map((r) => r.accountId)
+    );
+    const before = ids.length;
+    ids = ids.filter((id) => withOrders.has(id));
+    console.log(
+      `ENRICH mode: ${ids.length}/${before} accounts that already have orders (skipping empty)`
+    );
+    const needTrack = existingPayload.reports
+      .filter((r) => withOrders.has(r.accountId))
+      .reduce((n, r) => {
+        for (const o of r.orders || []) {
+          if (isCancelled(o) || isDelivered(o)) continue;
+          if (!o.trackingId) n += 1;
+        }
+        return n;
+      }, 0);
+    console.log(`Open orders still missing tracking (from last report): ${needTrack}`);
+  }
+
+  console.log(`Checking orders for ${ids.length} account(s)…`);
+  console.log(
+    `Concurrency: ${FETCH_CONCURRENCY} parallel Chrome session(s)` +
+      (ENRICH ? " (enrich fast default 8)" : " (default 4)")
+  );
+  console.log(`Start stagger: ${START_STAGGER_MS}ms between first-wave sessions`);
+  if (WANT_DETAILS) {
+    console.log(
+      "Detail pages ON — re-verify fields + fetch tracking for every open order."
+    );
+  } else {
+    console.log("Detail pages OFF (--no-details) — tracking IDs will usually be empty.");
+  }
+  console.log(`Cookies: ${COOKIE_FILE}`);
+  console.log(`Report → ${OUT_FILE}`);
+  console.log(`Excel  → ${EXCEL_FILE}\n`);
+
+  let doneCount = 0;
+  let slotSeq = 0;
+  const freshById = new Map();
+
+  const freshReports = await mapPool(ids, FETCH_CONCURRENCY, async (id, index) => {
+    const slotIndex = slotSeq++;
+    if (START_STAGGER_MS > 0 && slotIndex < FETCH_CONCURRENCY) {
+      await new Promise((r) => setTimeout(r, START_STAGGER_MS * slotIndex));
+    }
+    logFor(id, `start [${index + 1}/${ids.length}] (slot ${slotIndex})`);
+    const report = await fetchOrdersForAccount(id, { slotIndex });
+    freshById.set(id, report);
+    doneCount += 1;
+    const tracked = (report.orders || []).filter((o) => o.trackingId).length;
+    logFor(
+      id,
+      report.ok
+        ? `done — ${report.count} order(s), tracking ${tracked}  (${doneCount}/${ids.length})`
+        : `ERROR: ${report.error}  (${doneCount}/${ids.length})`
+    );
+
+    // Checkpoint every 25 accounts so progress isn't lost
+    if (ENRICH && existingPayload && doneCount % 25 === 0) {
+      const merged = mergeReports(existingPayload.reports, [...freshById.values()]);
+      writePayload(merged, { enrich: true });
+      console.log(`  ↳ checkpoint saved (${doneCount}/${ids.length})`);
+    }
+
+    return report;
+  });
+
+  let reports = freshReports;
+  if (ENRICH && existingPayload) {
+    reports = mergeReports(existingPayload.reports, freshReports);
+  }
+
+  const summary = writePayload(reports, { enrich: ENRICH });
+  printSummary(summary.summary);
   const excelPath = writeExcelReport(summary);
   console.log(`Saved: ${OUT_FILE}`);
   console.log(`Excel: ${excelPath}`);
+
+  if (ENRICH) {
+    let withTrack = 0;
+    let open = 0;
+    for (const r of reports) {
+      for (const o of r.orders || []) {
+        if (isCancelled(o) || isDelivered(o)) continue;
+        open += 1;
+        if (o.trackingId) withTrack += 1;
+      }
+    }
+    console.log(`Open orders with tracking: ${withTrack}/${open}`);
+  }
 }
 
 main().catch((err) => {

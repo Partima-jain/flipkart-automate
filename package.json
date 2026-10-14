@@ -8,12 +8,16 @@
     "mobile": "node open-mobile.js",
     "accounts": "node run-accounts.js",
     "accounts:fast": "node run-accounts.js --concurrency=3",
-    "orders": "node check-orders.js",
+    "orders": "node check-orders.js --concurrency=4",
+    "orders:fast": "node check-orders.js --concurrency=6",
+    "orders:enrich": "node check-orders.js --enrich --concurrency=8",
+    "orders:list-only": "node check-orders.js --concurrency=6 --no-details",
     "orders:browse": "node check-orders.js --browse --batch=3",
     "browse": "node browse-orders.js",
     "browse:14": "node browse-orders.js --cookie-file=cookies-files/cookie-14.json",
     "orders:excel": "node check-orders.js --from-json",
     "pending": "node build-cookie-pending.js",
+    "usage-cookies": "node build-usage-cookies.js",
     "qr": "node qr-demo.js"
   },
   "dependencies": {
