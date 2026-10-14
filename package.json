@@ -10,6 +10,8 @@
     "accounts:fast": "node run-accounts.js --concurrency=3",
     "orders": "node check-orders.js",
     "orders:browse": "node check-orders.js --browse --batch=3",
+    "browse": "node browse-orders.js",
+    "browse:14": "node browse-orders.js --cookie-file=cookies-files/cookie-14.json",
     "orders:excel": "node check-orders.js --from-json",
     "pending": "node build-cookie-pending.js",
     "qr": "node qr-demo.js"
