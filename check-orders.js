@@ -475,6 +475,17 @@ function isCancelled(order) {
   return /cancel/i.test(hay);
 }
 
+function isDelivered(order) {
+  const status = String(order.status || "").trim();
+  const arriving = String(order.arriving || "");
+  // Already delivered — exclude from Excel. Skip "not … delivered" / "Out for delivery".
+  if (/not\s+(?:been\s+)?(?:dispatched or )?delivered/i.test(`${status} ${arriving}`)) {
+    return false;
+  }
+  if (/out for delivery/i.test(`${status} ${arriving}`)) return false;
+  return /^delivered\b/i.test(status) || /\bDelivered on\b/i.test(arriving);
+}
+
 function isMobile(order) {
   return /s25\s*fe|galaxy-s25|mobile/i.test(order.product || "");
 }
@@ -606,6 +617,7 @@ function buildByDeliveryDate(reports) {
   const map = new Map();
   for (const report of reports) {
     for (const o of report.orders || []) {
+      if (isDelivered(o)) continue;
       const key = deliveryBucket(o);
       if (!map.has(key)) {
         map.set(key, { "Delivery / expected": key, Phones: 0, Tabs: 0, Other: 0 });
@@ -631,15 +643,68 @@ function buildByDeliveryDate(reports) {
     );
 }
 
-/** Write Summary + Orders + By Account + By Delivery Date sheets */
+/** Parse month + day from arriving / bucket text (e.g. "Tomorrow, Oct 14", "Fri Oct 16"). */
+function parseArrivingMonthDay(order) {
+  const raw = `${order.arriving || ""} ${deliveryBucket(order)}`;
+  if (isCancelled(order) || /cancel/i.test(raw)) return null;
+  const m = raw.match(
+    /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\b/i
+  );
+  if (!m) return null;
+  return { month: m[1], day: Number(m[2]) };
+}
+
+function deviceLabel(order) {
+  if (isTab(order)) return "Tab";
+  if (isMobile(order)) return "Mobile";
+  return "Other";
+}
+
+/**
+ * Rows for a target calendar day (month + day), non-cancelled only.
+ * Columns: Mail ID, Tracking ID, Delivery expected, Device.
+ */
+function buildArrivingDayRows(reports, month, day) {
+  const monthRe = new RegExp(`^${month}$`, "i");
+  const rows = [];
+  for (const report of reports) {
+    for (const o of report.orders || []) {
+      if (isCancelled(o) || isDelivered(o)) continue;
+      const md = parseArrivingMonthDay(o);
+      if (!md || !monthRe.test(md.month) || md.day !== day) continue;
+      rows.push({
+        "Mail ID": report.accountId || "",
+        "Tracking ID": o.trackingId || "",
+        "Delivery expected": o.arriving || deliveryBucket(o),
+        Device: deviceLabel(o),
+        "Order ID": o.orderId || "",
+      });
+    }
+  }
+  rows.sort((a, b) =>
+    String(a["Mail ID"]).localeCompare(String(b["Mail ID"])) ||
+    String(a["Order ID"]).localeCompare(String(b["Order ID"]))
+  );
+  return rows;
+}
+
+/** Write Summary + Orders + By Account + By Delivery Date sheets (delivered excluded). */
 function writeExcelReport(payload) {
   const reports = payload.reports || [];
-  const stats = payload.summary || buildSummary(reports);
+  const reportsOpen = reports.map((r) => ({
+    ...r,
+    orders: (r.orders || []).filter((o) => !isDelivered(o)),
+  }));
+  const stats = buildSummary(reportsOpen);
   const checkedAt = payload.checked_at || new Date().toISOString();
-  const byDelivery = buildByDeliveryDate(reports);
+  const byDelivery = buildByDeliveryDate(reportsOpen);
+  const arrivingOct14 = buildArrivingDayRows(reportsOpen, "Oct", 14);
+  const arrivingOct15 = buildArrivingDayRows(reportsOpen, "Oct", 15);
+  const arrivingOct16 = buildArrivingDayRows(reportsOpen, "Oct", 16);
 
   const summaryRows = [
     { Field: "Checked at", Value: checkedAt },
+    { Field: "Note", Value: "Delivered orders excluded from this Excel" },
     { Field: "Accounts", Value: stats.accounts },
     { Field: "Total orders", Value: stats.total_orders },
     { Field: "Mobile orders", Value: stats.mobile?.orders ?? 0 },
@@ -661,7 +726,7 @@ function writeExcelReport(payload) {
   const orderRows = [];
   for (const report of reports) {
     const accountId = report.accountId || "";
-    const orders = report.orders || [];
+    const orders = (report.orders || []).filter((o) => !isDelivered(o));
     if (!orders.length) {
       orderRows.push({
         Account: accountId,
@@ -669,7 +734,7 @@ function writeExcelReport(payload) {
         Product: "",
         Type: "",
         Qty: "",
-        Status: report.ok === false ? `ERROR: ${report.error || ""}` : "(no orders)",
+        Status: report.ok === false ? `ERROR: ${report.error || ""}` : "(no open orders)",
         Outcome: "",
         Arriving: "",
         "Delivery bucket": "",
@@ -696,7 +761,7 @@ function writeExcelReport(payload) {
   }
 
   const byAccountRows = reports.map((report) => {
-    const orders = report.orders || [];
+    const orders = (report.orders || []).filter((o) => !isDelivered(o));
     let mobile = 0;
     let tab = 0;
     let success = 0;
@@ -719,21 +784,91 @@ function writeExcelReport(payload) {
     };
   });
 
+  const emptyDay = [{ "Mail ID": "", "Tracking ID": "", "Delivery expected": "(none)", Device: "", "Order ID": "" }];
+
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), "Summary");
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(byDelivery), "By Delivery Date");
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet(arrivingOct14.length ? arrivingOct14 : emptyDay),
+    "Oct 14"
+  );
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet(arrivingOct15.length ? arrivingOct15 : emptyDay),
+    "Oct 15"
+  );
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet(arrivingOct16.length ? arrivingOct16 : emptyDay),
+    "Oct 16"
+  );
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(orderRows), "Orders");
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(byAccountRows), "By Account");
   XLSX.writeFile(wb, EXCEL_FILE);
+  console.log(
+    `Arriving sheets: Oct 14=${arrivingOct14.length}, Oct 15=${arrivingOct15.length}, Oct 16=${arrivingOct16.length}`
+  );
   return EXCEL_FILE;
+}
+
+/** Rebuild report payload from existing order-report.xlsx Orders sheet. */
+function payloadFromExcel(excelPath = EXCEL_FILE) {
+  if (!fs.existsSync(excelPath)) {
+    throw new Error(`No ${excelPath}`);
+  }
+  const wb = XLSX.readFile(excelPath);
+  const sheet = wb.Sheets.Orders;
+  if (!sheet) throw new Error(`No "Orders" sheet in ${path.basename(excelPath)}`);
+  const rows = XLSX.utils.sheet_to_json(sheet);
+  const byAccount = new Map();
+  for (const r of rows) {
+    const accountId = r.Account || "";
+    if (!accountId) continue;
+    if (!byAccount.has(accountId)) {
+      byAccount.set(accountId, {
+        accountId,
+        ok: true,
+        orders: [],
+        checked_at: r.Checked || null,
+      });
+    }
+    if (!r["Order ID"] && /no orders|ERROR/i.test(String(r.Status || ""))) {
+      continue;
+    }
+    if (!r["Order ID"]) continue;
+    byAccount.get(accountId).orders.push({
+      orderId: r["Order ID"] || null,
+      product: r.Product || null,
+      quantity: r.Qty ?? 1,
+      status: r.Status || null,
+      arriving: r.Arriving || null,
+      trackingId: r["Tracking ID"] || null,
+    });
+  }
+  const reports = [...byAccount.values()].map((rep) => ({
+    ...rep,
+    count: rep.orders.length,
+  }));
+  return {
+    checked_at: new Date().toISOString(),
+    reports,
+    summary: buildSummary(reports),
+  };
 }
 
 async function main() {
   if (FROM_JSON) {
-    if (!fs.existsSync(OUT_FILE)) {
-      throw new Error(`No ${OUT_FILE} — run without --from-json first.`);
+    let payload;
+    if (fs.existsSync(OUT_FILE)) {
+      payload = JSON.parse(fs.readFileSync(OUT_FILE, "utf8"));
+    } else if (fs.existsSync(EXCEL_FILE)) {
+      console.log(`No ${path.basename(OUT_FILE)} — rebuilding from ${path.basename(EXCEL_FILE)}`);
+      payload = payloadFromExcel(EXCEL_FILE);
+    } else {
+      throw new Error(`No ${OUT_FILE} or ${EXCEL_FILE} — run a full check first.`);
     }
-    const payload = JSON.parse(fs.readFileSync(OUT_FILE, "utf8"));
     const excelPath = writeExcelReport(payload);
     printSummary(payload.summary || buildSummary(payload.reports || []));
     console.log(`Excel saved: ${excelPath}`);
