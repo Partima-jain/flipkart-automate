@@ -5,3 +5,7 @@ account-results.json
 .DS_Store
 
 cookies-files/
+checkout-api-capture.json
+place-orders-api-result.json
+order-report.json
+order-report.xlsx
