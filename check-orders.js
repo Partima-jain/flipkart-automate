@@ -12,6 +12,10 @@
  *   node check-orders.js --from-json        # rebuild Excel from existing order-report.json
  *   node check-orders.js --enrich          # only re-check accounts that already have orders
  *   node check-orders.js --enrich --concurrency=8
+ *   node check-orders.js --api             # fast: Rome HTTP API + cookies (no Chrome)
+ *   node check-orders.js --api --concurrency=12
+ *   node check-orders.js --api --retry-failed  # re-fetch accounts that errored / missing tracking
+ *   node check-orders.js --api --fallback  # if API fails for an account, use Chrome
  *   node check-orders.js --browse           # open 3 phone Chromes → Orders; next batch when all closed
  *   node check-orders.js --browse --batch=3 --cookie-file=cookie-pending.json
  */
@@ -21,6 +25,11 @@ const path = require("path");
 const os = require("os");
 const XLSX = require("xlsx");
 const { openFlipkartMobileSession } = require("./lib/session");
+const {
+  cookieHeaderForAccount,
+  fetchMyOrdersJson,
+  fetchOrderDetailJson,
+} = require("./lib/rome-api");
 
 const COOKIE_FILE_ARG = (
   process.argv.find((a) => a.startsWith("--cookie-file=")) || ""
@@ -39,6 +48,9 @@ const WANT_DETAILS = !process.argv.includes("--no-details");
 const FROM_JSON = process.argv.includes("--from-json");
 const BROWSE = process.argv.includes("--browse");
 const ENRICH = process.argv.includes("--enrich");
+const USE_API = process.argv.includes("--api");
+const API_FALLBACK = process.argv.includes("--fallback");
+const RETRY_FAILED = process.argv.includes("--retry-failed");
 const BATCH =
   parseInt(
     (process.argv.find((a) => a.startsWith("--batch=")) || "").split("=")[1] ||
@@ -49,11 +61,19 @@ const BATCH =
 function parseFetchConcurrency() {
   const arg = process.argv.find((a) => a.startsWith("--concurrency="));
   const raw = arg ? arg.split("=")[1] : process.env.CONCURRENCY;
-  // Enrich defaults higher — only accounts with orders
-  let n = parseInt(raw || (ENRICH ? "8" : "4"), 10);
-  if (!Number.isFinite(n) || n < 1) n = ENRICH ? 8 : 4;
-  const max =
-    Math.max(1, Math.min(10, parseInt(process.env.CONCURRENCY_MAX || "10", 10) || 10));
+  // Keep API concurrency moderate — too high causes DNS ENOTFOUND under load
+  const def = USE_API ? "12" : ENRICH ? "8" : "4";
+  let n = parseInt(raw || def, 10);
+  if (!Number.isFinite(n) || n < 1) n = parseInt(def, 10);
+  const maxDefault = USE_API ? "24" : "10";
+  const max = Math.max(
+    1,
+    Math.min(
+      USE_API ? 40 : 10,
+      parseInt(process.env.CONCURRENCY_MAX || maxDefault, 10) ||
+        parseInt(maxDefault, 10)
+    )
+  );
   return Math.min(n, max);
 }
 
@@ -61,9 +81,10 @@ const FETCH_CONCURRENCY = parseFetchConcurrency();
 const START_STAGGER_MS = Math.max(
   0,
   parseInt(
-    process.env.START_STAGGER_MS || (ENRICH ? "300" : "800"),
+    process.env.START_STAGGER_MS ||
+      (USE_API ? "0" : ENRICH ? "300" : "800"),
     10
-  ) || (ENRICH ? 300 : 800)
+  ) || (USE_API ? 0 : ENRICH ? 300 : 800)
 );
 const MAX_DETAIL_ARG = (
   process.argv.find((a) => a.startsWith("--max=")) || ""
@@ -555,7 +576,130 @@ function logFor(id, ...args) {
   console.log(`[${id}]`, ...args);
 }
 
+/**
+ * Fast path: Rome HTTP API with account cookies (no Chrome).
+ */
+async function fetchOrdersForAccountViaApi(accountId) {
+  try {
+    const cookieHeader = cookieHeaderForAccount(accountId, {
+      cookieFile: COOKIE_FILE,
+    });
+    const listRes = await fetchMyOrdersJson(cookieHeader);
+    if (!listRes?.json) {
+      throw new Error("My Orders API returned empty JSON");
+    }
+
+    let orders = extractListOrders(listRes.json);
+    logFor(
+      accountId,
+      `API list: ${orders.length} order card(s) via ${listRes.host}`
+    );
+
+    if (WANT_DETAILS && orders.length) {
+      const needDetail = orders.filter(
+        (o) => !isCancelled(o) && !isDelivered(o)
+      );
+      const toFetch = needDetail.slice(
+        0,
+        Number.isFinite(MAX_DETAIL) ? MAX_DETAIL : needDetail.length
+      );
+      logFor(accountId, `API detail: ${toFetch.length} open order(s)`);
+
+      // Parallel detail fetches per account (small pool)
+      // Low per-account detail parallelism to avoid DNS storms
+      const detailConcurrency = Math.min(3, Math.max(1, toFetch.length));
+      let di = 0;
+      async function detailWorker() {
+        while (di < toFetch.length) {
+          const i = di++;
+          const o = toFetch[i];
+          const listArriving = o.arriving;
+          try {
+            const detailRes = await fetchOrderDetailJson(
+              cookieHeader,
+              o.orderId,
+              o.unitId
+            );
+            if (detailRes?.json) {
+              const d = extractDetailFields(detailRes.json);
+              o.product = cleanProduct(d.product) || o.product;
+              o.arriving = pickBestArriving(
+                d.arriving,
+                extractArrivingFromText(detailRes.raw),
+                listArriving,
+                o.arriving
+              );
+              o.status = d.status || o.status;
+              o.trackingId =
+                d.trackingId ||
+                extractTrackingId(detailRes.raw) ||
+                o.trackingId ||
+                null;
+              o.source = "rome_api+detail";
+            }
+          } catch (err) {
+            logFor(
+              accountId,
+              `API detail failed ${o.orderId}: ${err.message || err}`
+            );
+          }
+        }
+      }
+      await Promise.all(
+        Array.from({ length: detailConcurrency }, () => detailWorker())
+      );
+
+      const open = orders.filter((o) => !isCancelled(o) && !isDelivered(o));
+      const withTrack = open.filter((o) => o.trackingId).length;
+      const withDate = open.filter((o) => o.arriving).length;
+      logFor(
+        accountId,
+        `API open: ${open.length} | delivery ${withDate} | tracking ${withTrack}`
+      );
+    }
+
+    orders = orders.map((o) => ({
+      orderId: o.orderId,
+      product: o.product,
+      quantity: o.quantity,
+      status: o.status,
+      arriving: o.arriving,
+      trackingId: o.trackingId,
+      source: o.source || "rome_api",
+    }));
+
+    return {
+      accountId,
+      ok: true,
+      count: orders.length,
+      orders,
+      checked_at: new Date().toISOString(),
+      via: "api",
+    };
+  } catch (err) {
+    return {
+      accountId,
+      ok: false,
+      error: String(err.message || err),
+      count: 0,
+      orders: [],
+      checked_at: new Date().toISOString(),
+      via: "api",
+    };
+  }
+}
+
 async function fetchOrdersForAccount(accountId, { slotIndex = 0 } = {}) {
+  if (USE_API) {
+    const apiReport = await fetchOrdersForAccountViaApi(accountId);
+    if (apiReport.ok) return apiReport;
+    if (!API_FALLBACK) return apiReport;
+    logFor(
+      accountId,
+      `API failed (${apiReport.error}) — falling back to Chrome…`
+    );
+  }
+
   let browser;
   let cleanup = () => {};
 
@@ -1440,11 +1584,31 @@ async function main() {
   let ids = readAccountIds();
   let existingPayload = null;
 
-  if (ENRICH) {
+  if (ENRICH || RETRY_FAILED) {
     existingPayload = loadExistingPayload();
     if (!existingPayload?.reports?.length) {
-      throw new Error("--enrich needs an existing order-report.json (run a full check first).");
+      throw new Error(
+        `${ENRICH ? "--enrich" : "--retry-failed"} needs an existing order-report.json`
+      );
     }
+  }
+
+  if (RETRY_FAILED && existingPayload) {
+    const before = ids.length;
+    ids = ids.filter((id) => {
+      const r = existingPayload.reports.find((x) => x.accountId === id);
+      if (!r) return true;
+      if (!r.ok || r.error || r.enrich_error) return true;
+      const open = (r.orders || []).filter(
+        (o) => !isCancelled(o) && !isDelivered(o)
+      );
+      // Retry if any open order missing tracking or delivery date
+      return open.some((o) => !o.trackingId || !o.arriving);
+    });
+    console.log(
+      `RETRY-FAILED: ${ids.length}/${before} accounts (errors or missing tracking/date)`
+    );
+  } else if (ENRICH && existingPayload) {
     const withOrders = new Set(
       existingPayload.reports
         .filter((r) => (r.orders || []).length > 0)
@@ -1468,17 +1632,29 @@ async function main() {
   }
 
   console.log(`Checking orders for ${ids.length} account(s)…`);
-  console.log(
-    `Concurrency: ${FETCH_CONCURRENCY} parallel Chrome session(s)` +
-      (ENRICH ? " (enrich fast default 8)" : " (default 4)")
-  );
-  console.log(`Start stagger: ${START_STAGGER_MS}ms between first-wave sessions`);
-  if (WANT_DETAILS) {
+  if (USE_API) {
     console.log(
-      "Detail pages ON — re-verify fields + fetch tracking for every open order."
+      `Mode: Rome HTTP API (no Chrome)` +
+        (API_FALLBACK ? " + Chrome fallback on failure" : "")
+    );
+    console.log(
+      `Concurrency: ${FETCH_CONCURRENCY} parallel account request(s) (API default 12)`
     );
   } else {
-    console.log("Detail pages OFF (--no-details) — tracking IDs will usually be empty.");
+    console.log(
+      `Concurrency: ${FETCH_CONCURRENCY} parallel Chrome session(s)` +
+        (ENRICH ? " (enrich fast default 8)" : " (default 4)")
+    );
+    console.log(
+      `Start stagger: ${START_STAGGER_MS}ms between first-wave sessions`
+    );
+  }
+  if (WANT_DETAILS) {
+    console.log(
+      "Details ON — refresh delivery date + tracking for every open order."
+    );
+  } else {
+    console.log("Details OFF (--no-details) — tracking IDs will usually be empty.");
   }
   console.log(`Cookies: ${COOKIE_FILE}`);
   console.log(`Report → ${OUT_FILE}`);
@@ -1506,8 +1682,14 @@ async function main() {
     );
 
     // Checkpoint every 25 accounts so progress isn't lost
-    if (ENRICH && existingPayload && doneCount % 25 === 0) {
-      const merged = mergeReports(existingPayload.reports, [...freshById.values()]);
+    if (
+      (ENRICH || USE_API) &&
+      existingPayload &&
+      doneCount % 25 === 0
+    ) {
+      const merged = mergeReports(existingPayload.reports, [
+        ...freshById.values(),
+      ]);
       writePayload(merged, { enrich: true });
       console.log(`  ↳ checkpoint saved (${doneCount}/${ids.length})`);
     }
@@ -1516,11 +1698,25 @@ async function main() {
   });
 
   let reports = freshReports;
-  if (ENRICH && existingPayload) {
-    reports = mergeReports(existingPayload.reports, freshReports);
+  // Merge into existing report when enriching OR when filtering a subset of ids
+  // so a single-account test never wipes the full order-report.json.
+  if (!existingPayload && (ENRICH || FILTER || USE_API)) {
+    existingPayload = loadExistingPayload();
+  }
+  if (existingPayload?.reports?.length && (ENRICH || RETRY_FAILED || FILTER || USE_API)) {
+    if (
+      ENRICH ||
+      RETRY_FAILED ||
+      FILTER ||
+      (USE_API && ids.length < (existingPayload.reports || []).length)
+    ) {
+      reports = mergeReports(existingPayload.reports, freshReports);
+    }
   }
 
-  const summary = writePayload(reports, { enrich: ENRICH });
+  const summary = writePayload(reports, {
+    enrich: ENRICH || RETRY_FAILED || USE_API,
+  });
   printSummary(summary.summary);
   const excelPath = writeExcelReport(summary);
   console.log(`Saved: ${OUT_FILE}`);
