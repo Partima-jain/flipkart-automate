@@ -9,6 +9,8 @@
  *   node check-orders.js --details          # also open each order detail page
  *   node check-orders.js --max=10
  *   node check-orders.js --from-json        # rebuild Excel from existing order-report.json
+ *   node check-orders.js --browse           # open 3 phone Chromes → Orders; next batch when all closed
+ *   node check-orders.js --browse --batch=3 --cookie-file=cookie-pending.json
  */
 
 const fs = require("fs");
@@ -16,13 +18,30 @@ const path = require("path");
 const XLSX = require("xlsx");
 const { openFlipkartMobileSession } = require("./lib/session");
 
-const COOKIE_FILE = path.join(__dirname, "cookie.json");
+const COOKIE_FILE_ARG = (
+  process.argv.find((a) => a.startsWith("--cookie-file=")) || ""
+).split("=")[1];
+const COOKIE_FILE = COOKIE_FILE_ARG
+  ? path.isAbsolute(COOKIE_FILE_ARG)
+    ? COOKIE_FILE_ARG
+    : path.join(__dirname, COOKIE_FILE_ARG)
+  : path.join(__dirname, "cookie.json");
 const OUT_FILE = path.join(__dirname, "order-report.json");
 const EXCEL_FILE = path.join(__dirname, "order-report.xlsx");
 const ORDERS_URL = "https://www.flipkart.com/rv/orders?link=home_orders";
 
 const WANT_DETAILS = process.argv.includes("--details");
 const FROM_JSON = process.argv.includes("--from-json");
+const BROWSE = process.argv.includes("--browse");
+const BATCH =
+  parseInt(
+    (process.argv.find((a) => a.startsWith("--batch=")) || "").split("=")[1] ||
+      (process.argv.find((a) => a.startsWith("--concurrency=")) || "").split(
+        "="
+      )[1] ||
+      "3",
+    10
+  ) || 3;
 const MAX_DETAIL =
   parseInt(
     (process.argv.find((a) => a.startsWith("--max=")) || "").split("=")[1] || "12",
@@ -40,8 +59,129 @@ function readAccountIds() {
       String(a.id || "").toLowerCase().includes(FILTER.toLowerCase())
     );
   }
-  if (!accounts.length) throw new Error("No matching accounts in cookie.json.");
+  if (!accounts.length) {
+    throw new Error(`No matching accounts in ${path.basename(COOKIE_FILE)}.`);
+  }
   return accounts.map((a) => a.id);
+}
+
+function allPages(browser) {
+  return browser.contexts().flatMap((c) => c.pages());
+}
+
+/**
+ * Closing an Incognito window often leaves CDP connected briefly.
+ * Treat "no pages left" OR browser disconnect as "session done".
+ */
+async function waitUntilSessionDone(browser) {
+  if (!browser.isConnected()) return;
+
+  await new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearInterval(poll);
+      resolve();
+    };
+
+    browser.once("disconnected", done);
+
+    const watchPage = (page) => {
+      page.once("close", () => {
+        setTimeout(() => {
+          if (!browser.isConnected() || allPages(browser).length === 0) done();
+        }, 400);
+      });
+    };
+
+    for (const context of browser.contexts()) {
+      context.on("page", watchPage);
+      for (const page of context.pages()) watchPage(page);
+    }
+
+    const poll = setInterval(() => {
+      if (!browser.isConnected() || allPages(browser).length === 0) done();
+    }, 500);
+  });
+}
+
+async function openOrdersBrowseSession(accountId, slotIndex) {
+  const session = await openFlipkartMobileSession(accountId, {
+    slotIndex,
+    cookieFile: COOKIE_FILE,
+  });
+  const page = session.browser.contexts()[0].pages()[0];
+  await page.goto(ORDERS_URL, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000,
+  });
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+  console.log(`  → Orders open: ${accountId}`);
+  return session;
+}
+
+async function runBrowseBatches(ids) {
+  const batchSize = Math.max(1, BATCH);
+  const totalBatches = Math.ceil(ids.length / batchSize);
+  console.log(
+    `Browse mode: ${ids.length} account(s), ${batchSize} at a time → My Orders`
+  );
+  console.log(`Cookies: ${path.basename(COOKIE_FILE)}`);
+  console.log(
+    "Do your work, then close each Chrome window. Next batch starts when all are closed.\n"
+  );
+
+  for (let b = 0; b < totalBatches; b++) {
+    const batch = ids.slice(b * batchSize, (b + 1) * batchSize);
+    console.log(
+      `=== Batch ${b + 1}/${totalBatches} (${batch.length}) ===\n` +
+        batch.map((id, i) => `  ${i + 1}. ${id}`).join("\n")
+    );
+
+    const sessions = [];
+    for (let i = 0; i < batch.length; i++) {
+      try {
+        sessions.push(await openOrdersBrowseSession(batch[i], i));
+      } catch (err) {
+        console.error(`  Failed ${batch[i]}: ${err.message || err}`);
+      }
+      // Small stagger so windows tile cleanly
+      if (i < batch.length - 1) {
+        await new Promise((r) => setTimeout(r, 400));
+      }
+    }
+
+    if (!sessions.length) {
+      console.log("  No sessions opened in this batch — skipping.\n");
+      continue;
+    }
+
+    console.log(
+      `\nWaiting until you close all ${sessions.length} Chrome window(s)…\n`
+    );
+
+    await Promise.all(
+      sessions.map(async (session) => {
+        await waitUntilSessionDone(session.browser);
+        try {
+          if (session.browser?.isConnected()) await session.browser.close();
+        } catch (_) {
+          /* ignore */
+        }
+        try {
+          session.cleanup?.();
+        } catch (_) {
+          /* ignore */
+        }
+        console.log(`  Cleared session: ${session.accountId}`);
+      })
+    );
+
+    console.log(`Batch ${b + 1}/${totalBatches} done.\n`);
+  }
+
+  console.log("All batches finished.");
 }
 
 function productFromIcon(iconUrl = "", blob = "") {
@@ -237,7 +377,9 @@ async function fetchOrdersForAccount(accountId) {
   let cleanup = () => {};
 
   try {
-    const session = await openFlipkartMobileSession(accountId);
+    const session = await openFlipkartMobileSession(accountId, {
+      cookieFile: COOKIE_FILE,
+    });
     browser = session.browser;
     cleanup = session.cleanup || cleanup;
     const page = browser.contexts()[0].pages()[0];
@@ -429,11 +571,72 @@ function outcome(order) {
   return isCancelled(order) ? "Cancelled" : "Success";
 }
 
-/** Write Summary + Orders + By Account sheets to order-report.xlsx */
+/** Normalize arriving text → bucket key for delivery-date pivots. */
+function deliveryBucket(order) {
+  const raw = String(order.arriving || "").replace(/\s+/g, " ").trim();
+  if (isCancelled(order) || /^cancel/i.test(raw)) return "Cancelled";
+  if (!raw) return "Unknown / not set";
+
+  let m = raw.match(/Delivery expected by\s+(.+?)(?:\.|$)/i);
+  if (m) return `Expected: ${m[1].trim()}`;
+
+  m = raw.match(/Delivered on\s+(.+?)(?:\.|$)/i);
+  if (m) return `Delivered: ${m[1].trim()}`;
+
+  m = raw.match(/Arriving(?:\s+by)?\s+(.+?)(?:\.|$)/i);
+  if (m) return `Expected: ${m[1].trim()}`;
+
+  // Ignore long fee / policy blurbs mis-scraped as arriving
+  if (raw.length > 80 || /invoice|refund|fee may/i.test(raw)) return "Unknown / not set";
+  return raw;
+}
+
+function deliverySortKey(label) {
+  if (label === "Cancelled") return Number.MAX_SAFE_INTEGER - 1;
+  if (label === "Unknown / not set") return Number.MAX_SAFE_INTEGER;
+  const year = new Date().getFullYear();
+  const bare = label.replace(/^(Expected|Delivered):\s*/i, "");
+  const t = Date.parse(`${bare} ${year}`);
+  if (Number.isFinite(t)) return t;
+  return label;
+}
+
+/** Phone / tab counts per expected delivery date (tab qty 2 = 1 order). */
+function buildByDeliveryDate(reports) {
+  const map = new Map();
+  for (const report of reports) {
+    for (const o of report.orders || []) {
+      const key = deliveryBucket(o);
+      if (!map.has(key)) {
+        map.set(key, { "Delivery / expected": key, Phones: 0, Tabs: 0, Other: 0 });
+      }
+      const row = map.get(key);
+      if (isMobile(o)) row.Phones += 1;
+      else if (isTab(o)) row.Tabs += 1;
+      else row.Other += 1;
+    }
+  }
+
+  return [...map.values()]
+    .map((r) => ({
+      "Delivery / expected": r["Delivery / expected"],
+      Phones: r.Phones,
+      Tabs: r.Tabs,
+      Other: r.Other,
+      Total: r.Phones + r.Tabs + r.Other,
+    }))
+    .sort(
+      (a, b) =>
+        deliverySortKey(a["Delivery / expected"]) - deliverySortKey(b["Delivery / expected"])
+    );
+}
+
+/** Write Summary + Orders + By Account + By Delivery Date sheets */
 function writeExcelReport(payload) {
   const reports = payload.reports || [];
   const stats = payload.summary || buildSummary(reports);
   const checkedAt = payload.checked_at || new Date().toISOString();
+  const byDelivery = buildByDeliveryDate(reports);
 
   const summaryRows = [
     { Field: "Checked at", Value: checkedAt },
@@ -447,6 +650,12 @@ function writeExcelReport(payload) {
     { Field: "Tab cancelled", Value: stats.tab?.cancelled ?? 0 },
     { Field: "Overall success", Value: stats.success ?? 0 },
     { Field: "Overall cancelled", Value: stats.cancelled ?? 0 },
+    { Field: "", Value: "" },
+    { Field: "— By expected delivery —", Value: "Phones | Tabs" },
+    ...byDelivery.map((r) => ({
+      Field: r["Delivery / expected"],
+      Value: `${r.Phones} phones, ${r.Tabs} tabs` + (r.Other ? `, ${r.Other} other` : ""),
+    })),
   ];
 
   const orderRows = [];
@@ -463,6 +672,7 @@ function writeExcelReport(payload) {
         Status: report.ok === false ? `ERROR: ${report.error || ""}` : "(no orders)",
         Outcome: "",
         Arriving: "",
+        "Delivery bucket": "",
         "Tracking ID": "",
         Checked: report.checked_at || checkedAt,
       });
@@ -478,6 +688,7 @@ function writeExcelReport(payload) {
         Status: o.status || "",
         Outcome: outcome(o),
         Arriving: o.arriving || "",
+        "Delivery bucket": deliveryBucket(o),
         "Tracking ID": o.trackingId || "",
         Checked: report.checked_at || checkedAt,
       });
@@ -510,6 +721,7 @@ function writeExcelReport(payload) {
 
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), "Summary");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(byDelivery), "By Delivery Date");
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(orderRows), "Orders");
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(byAccountRows), "By Account");
   XLSX.writeFile(wb, EXCEL_FILE);
@@ -529,6 +741,12 @@ async function main() {
   }
 
   const ids = readAccountIds();
+
+  if (BROWSE) {
+    await runBrowseBatches(ids);
+    return;
+  }
+
   console.log(`Checking orders for ${ids.length} account(s)…`);
   if (WANT_DETAILS) console.log("Detail pages enabled (--details).");
   console.log(`Report → ${OUT_FILE}`);
